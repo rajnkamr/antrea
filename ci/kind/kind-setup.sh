@@ -269,13 +269,15 @@ function configure_vlan_subnets {
 
   bridge_id=$(docker network inspect kind -f {{.ID}})
   bridge_interface="br-${bridge_id:0:12}"
-  
+   
+  vlan_interfaces=()
   for vlan_subnet in "${VLAN_SUBNETS[@]}"; do
     # Extract VLAN ID and subnets
     vlan_id=$(echo $vlan_subnet | cut -d= -f1)
     subnets=$(echo $vlan_subnet | cut -d= -f2)
     
     vlan_interface="br-${bridge_id:0:7}.$vlan_id"
+    vlan_interfaces+=("$vlan_interface")
 
     docker_run_with_host_net ip link add link $bridge_interface name $vlan_interface type vlan id $vlan_id
     docker_run_with_host_net ip link set $vlan_interface up
@@ -287,7 +289,16 @@ function configure_vlan_subnets {
     done
 
     docker_run_with_host_net iptables -t filter -A FORWARD -i $bridge_interface -o $vlan_interface -j ACCEPT
-    docker_run_with_host_net iptables -t filter -A FORWARD -o $bridge_interface -i $vlan_interface -j ACCEPT
+    docker_run_with_host_net iptables -t filter -A FORWARD -i $vlan_interface -o $bridge_interface -j ACCEPT
+    docker_run_with_host_net iptables -t filter -A FORWARD -i $vlan_interface -o $vlan_interface -j ACCEPT
+  done
+
+  # Allow traffic between VLANs
+  for ((i=0; i<${#vlan_interfaces[@]}; i++)); do
+    for ((j=i+1; j<${#vlan_interfaces[@]}; j++)); do
+      docker_run_with_host_net iptables -t filter -A FORWARD -i ${vlan_interfaces[i]} -o ${vlan_interfaces[j]} -j ACCEPT
+      docker_run_with_host_net iptables -t filter -A FORWARD -i ${vlan_interfaces[j]} -o ${vlan_interfaces[i]} -j ACCEPT
+    done
   done
 
   if [[ $FLEXIBLE_IPAM == true ]]; then
@@ -393,7 +404,7 @@ function create {
   fi
 
   set +e
-  kind get clusters | grep $CLUSTER_NAME > /dev/null 2>&1
+  kind get clusters | grep -x "$CLUSTER_NAME" > /dev/null 2>&1
   if [[ $? -eq 0 ]]; then
     echoerr "cluster $CLUSTER_NAME already created"
     exit 0
@@ -447,6 +458,9 @@ EOF
     fi
     IMAGE_OPT="--image kindest/node:${K8S_VERSION}"
   fi
+
+  flock ~/.antrea/.clusters.lock --command "echo \"$CLUSTER_NAME $(date +%s)\" >> ~/.antrea/.clusters"
+  rm -rf ~/.antrea/.clusters.lock
   kind create cluster --name $CLUSTER_NAME --config $config_file $IMAGE_OPT
 
   # force coredns to run on control-plane node because it
@@ -497,7 +511,9 @@ EOF
 function destroy {
   update_kind_ipam_routes "del"
   if [[ $UNTIL_TIME_IN_MINS != "" ]]; then
-      clean_kind
+      if [[ -e ~/.antrea/.clusters ]]; then
+          clean_kind
+      fi
   else
       kind delete cluster --name $CLUSTER_NAME
   fi
@@ -545,19 +561,29 @@ function destroy_external_servers {
 
 function clean_kind {
     echo "=== Cleaning up stale kind clusters ==="
-    read -a all_kind_clusters <<< $(kind get clusters)
-    for kind_cluster_name in "${all_kind_clusters[@]}"; do
-        creationTimestamp=$(kubectl get nodes --context kind-$kind_cluster_name -o json -l node-role.kubernetes.io/control-plane | \
-        jq -r '.items[0].metadata.creationTimestamp')
-        creation=$(printUnixTimestamp "$creationTimestamp")
-        now=$(date -u '+%s')
-        diff=$((now-creation))
-        timeout=$(($UNTIL_TIME_IN_MINS*60))
-        if [[ $diff -gt $timeout ]]; then
-           echo "=== kind ${kind_cluster_name} present from more than $UNTIL_TIME_IN_MINS minutes ==="
-           kind delete cluster --name $kind_cluster_name
-        fi
-    done
+    (
+      flock -x 200
+
+      current_timestamp=$(date +%s)
+      > ~/.antrea/.clusters.swp
+      while IFS=' ' read -r name creationTimestamp; do
+          if [[ -z "$name" || -z "$creationTimestamp" ]]; then
+              continue
+          fi
+          # Calculate the time difference
+          time_difference=$((current_timestamp - creationTimestamp))
+          # Check if the creation happened more than 1 hour ago (3600 seconds)
+          if (( time_difference > 3600 )); then
+              echo "The creation of $name happened more than 1 hour ago."
+              kind delete cluster --name "$name" || echo "Cluster could not be deleted"
+          else
+              echo "The creation of $name happened within the last hour."
+              echo "$name $creationTimestamp" >> ~/.antrea/.clusters.swp
+          fi
+      done < ~/.antrea/.clusters
+      mv ~/.antrea/.clusters.swp ~/.antrea/.clusters
+    ) 200>>~/.antrea/.clusters.lock
+    rm -rf ~/.antrea/.clusters.lock
 }
 
 if ! command -v kind &> /dev/null
@@ -565,6 +591,8 @@ then
     echoerr "kind could not be found"
     exit 1
 fi
+
+mkdir -p ~/.antrea
 
 while [[ $# -gt 0 ]]
  do

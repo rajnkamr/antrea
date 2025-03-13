@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"text/template"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -35,9 +37,11 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/utils/ptr"
 
 	"antrea.io/antrea/pkg/agent/apis"
 	crdv1beta1 "antrea.io/antrea/pkg/apis/crd/v1beta1"
+	agentconfig "antrea.io/antrea/pkg/config/agent"
 	"antrea.io/antrea/pkg/controller/networkpolicy"
 	"antrea.io/antrea/pkg/features"
 	. "antrea.io/antrea/test/e2e/utils"
